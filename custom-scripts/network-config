@@ -1,0 +1,28 @@
+#!/bin/sh
+#
+# Configuring host communication.
+#
+case "$1" in
+    start)
+        printf "Configuring host communication."
+        /sbin/ip addr add 192.168.1.10/24 dev eth0
+        /sbin/ip link set dev eth0 up
+        /sbin/ip route add [IP-DO-HOST] dev eth0
+        /sbin/ip route add default via [IP-DO-HOST]
+        [ $? = 0 ] && echo "OK" || echo "FAIL"
+        ;;
+    stop)
+        printf "Shutdown host communication. "
+        /sbin/ip route del default
+        /sbin/ip link set eth0 down
+        [ $? = 0 ] && echo "OK" || echo "FAIL"
+        ;;
+    restart|reload)
+        "$0" stop
+        "$0" start
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart}"
+        exit 1
+esac
+exit $?
