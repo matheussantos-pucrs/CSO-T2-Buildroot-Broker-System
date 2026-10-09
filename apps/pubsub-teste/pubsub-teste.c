@@ -36,13 +36,30 @@ int main(void)
         return 1;
     }
 
+    /* Inscreve em dois topicos */
     if (send_command(device, "/subscribe teste") != 0)
         goto error;
 
-    if (send_command(device, "/publish teste \"Hello World!\"") != 0)
+    if (send_command(device, "/subscribe alertas") != 0)
         goto error;
 
+    /* Publica mensagem que ficara pendente */
+    if (send_command(device, "/publish teste \"Mensagem pendente\"") != 0)
+        goto error;
+
+    /* Seleciona o topico teste */
     if (send_command(device, "/fetch teste") != 0)
+        goto error;
+
+    /* Remove inscricao e mensagem pendente */
+    if (send_command(device, "/unsubscribe teste") != 0)
+        goto error;
+
+    /* Verifica se o outro topico continua funcionando */
+    if (send_command(device, "/publish alertas \"Hello World!\"") != 0)
+        goto error;
+
+    if (send_command(device, "/fetch alertas") != 0)
         goto error;
 
     len = fread(buffer, 1, strlen(text), device);

@@ -32,6 +32,7 @@ static int pubsub_release(struct inode *, struct file *);
 static int pubsub_subscribe(const char *);
 static int pubsub_publish(const char *, const char *);
 static int pubsub_fetch(struct file *, const char *);
+static int pubsub_unsubscribe(struct file *, const char *);
 
 static struct file_operations fops = {
     .owner   = THIS_MODULE,
@@ -426,6 +427,76 @@ unlock:
     return err;
 }
 
+
+static int pubsub_unsubscribe(struct file *filep, const char *name)
+{
+    struct topic_node *topic;
+    struct topic_node *tmp_topic;
+    struct subscriber_node *subscriber;
+    struct subscriber_node *tmp_subscriber;
+    struct message_node *message;
+    struct message_node *tmp_message;
+    pid_t pid = task_pid_nr(current);
+
+    if (name[0] == '\0' || strchr(name, '/') || strpbrk(name, " \t\r\n"))
+        return -EINVAL;
+
+    if (strlen(name) >= TOPIC_NAME_SIZE)
+        return -ENAMETOOLONG;
+
+    mutex_lock(&pubsub_mutex);
+
+    /* Procura o topico */
+    list_for_each_entry_safe(topic, tmp_topic, &topic_list, list) {
+        if (strcmp(topic->name, name) != 0)
+            continue;
+
+        /* Procura o processo inscrito */
+        list_for_each_entry_safe(subscriber, tmp_subscriber, &topic->subscribers, list) {
+            if (subscriber->pid != pid)
+                continue;
+
+            /* Remove as mensagens pendentes */
+            list_for_each_entry_safe(message, tmp_message, &subscriber->messages, list) {
+                list_del(&message->list);
+                kfree(message->message);
+                kfree(message);
+            }
+
+            /* Remove a inscricao */
+            list_del(&subscriber->list);
+            kfree(subscriber);
+
+            pr_info("PID %d unsubscribed from '%s'\n", pid, name);
+
+            /* Limpa o topico selecionado pelo fetch */
+            if (filep->private_data != NULL && strcmp(filep->private_data, name) == 0) {
+                kfree(filep->private_data);
+                filep->private_data = NULL;
+            }
+
+            /* Remove o topico se nao houver inscritos */
+            if (list_empty(&topic->subscribers)) {
+                pr_info("Topic '%s' removed\n", topic->name);
+
+                list_del(&topic->list);
+                kfree(topic);
+
+                number_of_topics--;
+            }
+
+            goto unlock;
+        }
+
+        break;
+    }
+
+unlock:
+    mutex_unlock(&pubsub_mutex);
+
+    return 0;
+}
+
 static ssize_t pubsub_write(struct file *filep, const char __user *buffer, size_t len, loff_t *offset)
 {
     char command[BUFFER_SIZE];
@@ -488,6 +559,15 @@ static ssize_t pubsub_write(struct file *filep, const char __user *buffer, size_
 
     if (strncmp(command, "/fetch ", 7) == 0) {
         err = pubsub_fetch(filep, strim(command + 7));
+
+        if (err != 0)
+            return err;
+
+        return len;
+    }
+
+    if (strncmp(command, "/unsubscribe ", 13) == 0) {
+        err = pubsub_unsubscribe(filep, strim(command + 13));
 
         if (err != 0)
             return err;

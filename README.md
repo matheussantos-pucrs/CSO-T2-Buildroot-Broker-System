@@ -1,10 +1,20 @@
 # Módulo Publish/Subscribe (`pubsub`)
 
-Módulo carregável do kernel Linux (*Loadable Kernel Module* — LKM) que fornece o dispositivo de caracteres `/dev/pubsub`. Ele implementa um mecanismo inicial de comunicação entre processos por tópicos, usando o modelo **Publish/Subscribe**.
+Módulo carregável do kernel Linux (*Loadable Kernel Module* — LKM) que fornece o dispositivo de caracteres `/dev/pubsub`. Implementa comunicação entre processos por tópicos, utilizando o modelo **Publish/Subscribe**.
 
-> **Pré-requisito:** os comandos deste README devem ser executados **dentro do Linux iniciado no QEMU**, com o módulo `pubsub.ko` já instalado na imagem do Buildroot. Este guia não abrange a instalação do Buildroot, a compilação do módulo nem a inicialização do QEMU.
+> **Pré-requisitos:** o Buildroot já deve estar configurado, a imagem deve conter o módulo `pubsub.ko` e a aplicação `pubsub-teste`, e o QEMU deve estar pronto para iniciar. **Apenas a seção 1 é executada no WSL; todos os comandos das seções seguintes são executados dentro do Linux no QEMU.** Este guia não cobre a compilação nem a configuração inicial do Buildroot.
 
-## 1. Carregar o módulo
+## 1. Iniciar o QEMU (no WSL)
+
+No terminal do **WSL**, acesse o diretório que contém o script `QEMU.sh` (por exemplo, a raiz do projeto Buildroot) e execute:
+
+```sh
+sh QEMU.sh
+```
+
+O script facilita a inicialização do QEMU com o ambiente já configurado. Após a inicialização, acesse o terminal do **Linux emulado**. Os próximos comandos devem ser executados **dentro do QEMU**, não no WSL.
+
+## 2. Carregar o módulo (dentro do QEMU)
 
 Carregue o módulo informando a quantidade máxima de tópicos:
 
@@ -12,9 +22,9 @@ Carregue o módulo informando a quantidade máxima de tópicos:
 modprobe pubsub max_topics=2
 ```
 
-O exemplo permite manter até **2 tópicos** ao mesmo tempo. Se o parâmetro não for informado, o valor padrão no código atual é `10`.
+O exemplo permite manter até **2 tópicos** ao mesmo tempo. Se o parâmetro não for informado, o valor padrão definido no código atual é `10`.
 
-Verifique se o módulo e o dispositivo estão presentes:
+Verifique se o módulo e o dispositivo estão disponíveis:
 
 ```sh
 lsmod
@@ -22,19 +32,19 @@ ls -l /dev/pubsub
 cat /sys/module/pubsub/parameters/max_topics
 ```
 
-O último comando deve mostrar `2` para o exemplo acima. O parâmetro `max_topics` é definido na carga do módulo e não pode ser alterado em tempo de execução nesta implementação.
+O último comando deve mostrar `2` no exemplo acima. O parâmetro `max_topics` é definido durante a carga do módulo e não pode ser alterado em tempo de execução nesta implementação (`0444`).
 
-## 2. Exibir as mensagens de log
+## 3. Exibir as mensagens de log (loglevel)
 
-O módulo utiliza `pr_info()` para registrar as operações no log do kernel. Dependendo do nível de log do console, essas mensagens podem não aparecer diretamente no terminal do QEMU.
+O módulo registra suas operações com `pr_info()`, mas essas mensagens podem não aparecer automaticamente no terminal devido ao nível de log do console.
 
-Consulte a configuração atual:
+Consulte o nível atual:
 
 ```sh
 cat /proc/sys/kernel/printk
 ```
 
-Para habilitar a exibição das mensagens informativas no console:
+Para exibir também as mensagens informativas no console do QEMU, execute:
 
 ```sh
 dmesg -n 8
@@ -46,89 +56,164 @@ Alternativamente:
 echo 8 > /proc/sys/kernel/printk
 ```
 
-Essa configuração altera o nível de mensagens mostradas **no console** durante a execução atual; não modifica permanentemente a imagem do Buildroot. Para consultar o buffer de logs sem depender da exibição automática no console:
+Essa alteração é **temporária**: modifica a exibição de mensagens no console durante a execução atual, sem alterar permanentemente a imagem do Buildroot. Também é possível consultar as mensagens armazenadas no buffer do kernel:
 
 ```sh
 dmesg | tail -30
 ```
 
-> Algumas mensagens do módulo não contêm o texto `pubsub`. Portanto, `dmesg | tail -30` pode ser mais útil do que filtrar apenas por `grep pubsub`.
+> Nem todas as mensagens do módulo contêm o texto `pubsub`. Por isso, `dmesg | tail -30` pode ser mais útil do que `dmesg | grep pubsub`.
 
-## 3. Abrir o dispositivo
+## 4. Arquitetura interna das mensagens
 
-Para os testes manuais, abra `/dev/pubsub` no descritor de arquivo 3 do shell e **mantenha-o aberto**:
+O broker mantém uma **lista global de tópicos**. Cada tópico contém uma **lista de inscritos, identificados por PID**, e cada inscrição mantém sua **própria fila de mensagens**.
+
+```text
+topic_list (lista global de tópicos)
+│
+├── Tópico "teste"
+│   │
+│   ├── PID 101
+│   │   ├── Mensagem 1: "Hello"
+│   │   └── Mensagem 2: "World"
+│   │
+│   └── PID 102
+│       ├── Mensagem 1: "Hello"
+│       └── Mensagem 2: "World"
+│
+└── Tópico "alertas"
+    │
+    └── PID 101
+        └── Mensagem 1: "Alerta!"
+```
+
+As estruturas utilizadas no módulo são:
+
+- `topic_node`: representa um tópico e sua lista `subscribers`.
+- `subscriber_node`: representa um PID inscrito em um tópico e sua fila `messages`.
+- `message_node`: representa uma mensagem pendente para um inscrito.
+
+Um mesmo PID pode aparecer em diferentes tópicos, mas suas filas são independentes. Quando alguém publica em `teste`, o módulo enfileira **uma cópia da mensagem para cada inscrito nesse tópico**. Quando um processo lê, só a cópia destinada a ele é retirada da fila.
+
+## 5. Testar o fluxo completo com a aplicação C
+
+A aplicação `pubsub-teste.c`, compilada para a arquitetura do Buildroot e incluída na imagem como `/usr/bin/pubsub-teste`, usa `stdio.h` para se comunicar com `/dev/pubsub`.
+
+Com o módulo carregado, execute **dentro do QEMU**:
+
+```sh
+pubsub-teste
+```
+
+O teste atual realiza, nessa ordem:
+
+1. `fopen("/dev/pubsub", "r+")`: abre e mantém o dispositivo aberto.
+2. `/subscribe teste`: cria o tópico (se necessário) e inscreve o processo.
+3. `/publish teste "Hello World!"`: coloca uma cópia da mensagem na fila do inscrito.
+4. `/fetch teste`: seleciona o tópico para a próxima leitura.
+5. `fread()`: consome uma mensagem da fila e a copia para a aplicação.
+6. `fclose()`: encerra a abertura e aciona `release()`, liberando inscrições e mensagens pendentes do processo.
+
+Saída esperada da aplicação:
+
+```text
+Received message: Hello World!
+```
+
+Para acompanhar os registros do driver:
+
+```sh
+dmesg | tail -30
+```
+
+Trecho ilustrativo dos logs (o PID varia):
+
+```text
+Topic 'teste' created
+PID 101 subscribed to 'teste'
+Published message to topic 'teste' for 1 subscriber(s)
+PID 101 selected topic 'teste'
+PID 101 read 12 bytes from 'teste'
+PID 101 unsubscribed from 'teste'
+Topic 'teste' removed
+```
+
+> **Importante:** `/fetch` **seleciona** o tópico; a mensagem só é consumida quando a aplicação chama `fread()`. Não use `cat /dev/pubsub` para validar esse fluxo: o `cat` é outro processo, com outro PID, que não possui a inscrição da aplicação.
+
+## 6. Testes manuais de inscrição e publicação
+
+Os exemplos a seguir servem para desenvolvimento e observação dos logs. Para a entrega, utilize a aplicação em C com `stdio.h`.
+
+Abra `/dev/pubsub` no descritor 3 do shell e **mantenha-o aberto**:
 
 ```sh
 exec 3<>/dev/pubsub
 ```
 
-Isso é importante porque o fechamento do dispositivo executa a operação `release`, que remove as inscrições do processo e libera suas mensagens pendentes.
-
-## 4. Inscrever-se em um tópico (`/subscribe`)
+### Inscrever-se em um tópico (`/subscribe`)
 
 ```sh
 printf '/subscribe teste\n' >&3
 ```
 
-Se o tópico `teste` não existir, ele será criado. O processo que realizou a inscrição será associado a esse tópico por seu PID. Repetir a inscrição do mesmo processo no mesmo tópico não cria uma inscrição duplicada.
-
-Consulte os registros:
+Se `teste` não existir, o módulo cria o tópico e inscreve o PID que realizou a operação. Repetir a inscrição não cria uma segunda entrada para o mesmo PID.
 
 ```sh
 dmesg | tail -15
 ```
 
-Exemplo de mensagens esperadas (o PID varia):
+Exemplo de log:
 
 ```text
 Topic 'teste' created
 PID 123 subscribed to 'teste'
 ```
 
-## 5. Publicar mensagens (`/publish`)
-
-Publique uma mensagem no tópico:
+### Publicar mensagens (`/publish`)
 
 ```sh
 printf '/publish teste "Hello World!"\n' >&3
-```
-
-Publique outras mensagens:
-
-```sh
 printf '/publish teste "Mensagem 2"\n' >&3
 printf '/publish teste "Mensagem 3"\n' >&3
 ```
 
-O módulo cria uma **cópia de cada mensagem para cada processo inscrito no tópico**, adicionando-a à fila de mensagens pendentes desse processo. Por enquanto, a confirmação é feita pelos logs:
+A publicação gera uma cópia de cada mensagem para a fila de cada inscrito. Se o tópico não existir ou não possuir inscritos, a publicação é ignorada.
 
 ```sh
 dmesg | tail -20
 ```
 
-Exemplo de mensagem esperada:
+Exemplo de log:
 
 ```text
 Published message to topic 'teste' for 1 subscriber(s)
 ```
 
-Se não houver processos inscritos ou se o tópico não existir, a publicação é ignorada.
+### Selecionar o tópico (`/fetch`)
 
-## 6. Testar o limite de tópicos
+```sh
+printf '/fetch teste\n' >&3
+```
 
-Se o módulo foi carregado com `max_topics=2`, crie mais um tópico:
+Esse comando apenas escolhe qual tópico será lido na próxima chamada de leitura. Para consumir uma mensagem, use `fread()` na aplicação C apresentada na seção 5, mantendo a mesma abertura do dispositivo e a inscrição do processo.
+
+> **Observação:** para esses comandos manuais, use um shell no qual `printf` seja um comando interno (*builtin*), para manter a identidade do processo. Se `printf` for executado como programa externo, o PID da operação poderá ser diferente do PID do shell que abriu o descritor.
+
+## 7. Testar o limite de tópicos
+
+Considerando o módulo carregado com `max_topics=2` e o descritor 3 ainda aberto, após criar o tópico `teste`, crie um segundo:
 
 ```sh
 printf '/subscribe alertas\n' >&3
 ```
 
-Agora tente criar um terceiro tópico:
+Agora tente criar um terceiro:
 
 ```sh
 printf '/subscribe noticias\n' >&3
 ```
 
-A terceira criação deverá ser recusada, porque o limite de dois tópicos já foi atingido. Consulte:
+O terceiro tópico não deverá ser criado, pois o limite foi atingido. Consulte:
 
 ```sh
 dmesg | tail -20
@@ -140,23 +225,21 @@ Mensagem esperada:
 Maximum number of topics reached
 ```
 
-## 7. Fechar o dispositivo e liberar recursos
+## 8. Fechar o dispositivo e liberar os recursos
 
-Ao terminar os testes, feche o descritor:
+Se utilizou o descritor 3 nos testes manuais, feche-o:
 
 ```sh
 exec 3>&-
 ```
 
-A função `release` percorre os tópicos e remove as inscrições associadas ao processo, libera suas mensagens pendentes e remove tópicos que ficarem sem inscritos.
-
-Verifique os registros:
+A função `release()` remove as inscrições associadas ao processo, libera as mensagens pendentes e remove os tópicos que ficarem vazios.
 
 ```sh
 dmesg | tail -20
 ```
 
-Exemplo de mensagens esperadas:
+Exemplo de logs:
 
 ```text
 PID 123 unsubscribed from 'teste'
@@ -165,9 +248,11 @@ PID 123 unsubscribed from 'alertas'
 Topic 'alertas' removed
 ```
 
-## 8. Descarregar o módulo
+No teste com a aplicação C, esse fechamento já acontece automaticamente no `fclose()`.
 
-Depois de fechar os arquivos que usam o dispositivo:
+## 9. Descarregar o módulo
+
+Depois de fechar os programas ou descritores que usam o dispositivo:
 
 ```sh
 modprobe -r pubsub
@@ -179,20 +264,24 @@ Verifique a mensagem de remoção:
 dmesg | tail -10
 ```
 
-## Comandos disponíveis no estágio atual
+## Funcionalidades no estágio atual
 
-| Comando | Situação | Finalidade |
+| Comando ou interface | Situação | Finalidade |
 | --- | --- | --- |
-| `/subscribe <topico>` | Implementado e testado | Inscreve o PID no tópico, criando-o quando necessário |
-| `/publish <topico> "<mensagem>"` | Implementado e testado por logs | Enfileira uma cópia da mensagem por inscrito |
-| `/fetch <topico>` | **Pendente** | Selecionar o tópico para a próxima leitura |
-| Leitura via `fread()` | **Pendente** | Consumir uma mensagem pendente por vez |
-| `/unsubscribe <topico>` | **Pendente** | Remover inscrição e mensagens do tópico |
-| `/sys/pubsub/<topico>` | **Pendente** | Configurar o limite de inscritos por tópico |
+| `/subscribe <topico>` | **Implementado e testado** | Inscreve o PID no tópico, criando-o quando necessário |
+| `/publish <topico> "<mensagem>"` | **Implementado e testado** | Enfileira uma cópia por inscrito |
+| `/fetch <topico>` | **Implementado e testado** | Seleciona o tópico para leitura |
+| `fread()` em `/dev/pubsub` | **Implementado e testado** | Consome uma mensagem pendente por vez |
+| Limpeza no `release()` | **Implementado e testado no fluxo básico** | Remove inscrições e libera recursos ao fechar |
+| `module_param(max_topics, int, 0444)` | **Implementado e testado** | Limita o número global de tópicos |
+| `/unsubscribe <topico>` | **Pendente** | Remove a inscrição sem fechar o dispositivo |
+| `/sys/pubsub/<topico>` | **Pendente** | Define o limite de inscritos em cada tópico |
+| Teste com múltiplos processos | **Pendente** | Confirma a independência das filas entre PIDs |
 
 ## Observações
 
-- Os exemplos com `exec` e `printf` são **testes manuais de desenvolvimento**; a entrega do trabalho exige uma aplicação em espaço de usuário utilizando funções da `stdio.h`, mantendo o dispositivo aberto entre os comandos.
-- Para validar comunicação entre múltiplos processos, serão necessários testes com instâncias distintas dessa aplicação, cada uma com sua própria inscrição.
-- O limite global de tópicos é configurado com `module_param(max_topics, int, 0444)`.
-- As mensagens pendentes são mantidas nas listas do kernel até serem consumidas futuramente pela rotina de leitura ou liberadas com o fechamento do dispositivo.
+- Este README pressupõe que `pubsub.ko` e `pubsub-teste` já estejam na imagem; o comando `sh QEMU.sh` apenas inicia o ambiente configurado.
+- O dispositivo `/dev/pubsub` é uma interface do kernel, não um arquivo de texto comum.
+- A aplicação mantém o dispositivo aberto entre os comandos; isso é necessário para conservar a inscrição e o tópico selecionado em `filep->private_data`.
+- As mensagens são armazenadas no espaço de kernel por meio de listas encadeadas; uma leitura bem-sucedida remove apenas a mensagem daquele inscrito.
+- O comando `/unsubscribe` ainda **não foi implementado**. A mensagem `unsubscribed` exibida ao executar `fclose()` vem da limpeza automática da função `release()`.
