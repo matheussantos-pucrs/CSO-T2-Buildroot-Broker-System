@@ -1,3 +1,4 @@
+
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/printk.h>
@@ -29,6 +30,7 @@ static ssize_t pubsub_write(struct file *, const char __user *, size_t, loff_t *
 static int pubsub_open(struct inode *, struct file *);
 static int pubsub_release(struct inode *, struct file *);
 static int pubsub_subscribe(const char *);
+static int pubsub_publish(const char *, const char *);
 
 static struct file_operations fops = {
     .owner   = THIS_MODULE,
@@ -48,12 +50,18 @@ static int max_topics = 10;
 module_param(max_topics, int, 0444);
 MODULE_PARM_DESC(max_topics, "Maximum number of topics");
 
-
 #define TOPIC_NAME_SIZE 32
+
+struct message_node {
+    struct list_head list;
+    struct subscriber_node *subscriber;
+    char *message;
+};
 
 struct subscriber_node {
     struct list_head list;
     pid_t pid;
+    struct list_head messages;
 };
 
 struct topic_node {
@@ -133,9 +141,16 @@ static void pubsub_exit(void)
     struct topic_node *tmp_topic;
     struct subscriber_node *subscriber;
     struct subscriber_node *tmp_subscriber;
+    struct message_node *message;
+    struct message_node *tmp_message;
 
     list_for_each_entry_safe(topic, tmp_topic, &topic_list, list) {
         list_for_each_entry_safe(subscriber, tmp_subscriber, &topic->subscribers, list) {
+            list_for_each_entry_safe(message, tmp_message, &subscriber->messages, list) {
+                list_del(&message->list);
+                kfree(message->message);
+                kfree(message);
+            }
             list_del(&subscriber->list);
             kfree(subscriber);
         }
@@ -163,10 +178,53 @@ static int pubsub_open(struct inode *inodep, struct file *filep)
 
 static int pubsub_release(struct inode *inodep, struct file *filep)
 {
-    pr_info("Publish/Subscribe device closed by PID %d\n", task_pid_nr(current));
+    struct topic_node *topic;
+    struct topic_node *tmp_topic;
+    struct subscriber_node *subscriber;
+    struct subscriber_node *tmp_subscriber;
+    struct message_node *message;
+    struct message_node *tmp_message;
+    pid_t pid = task_pid_nr(current);
+
+    mutex_lock(&pubsub_mutex);
+
+    list_for_each_entry_safe(topic, tmp_topic, &topic_list, list) {
+        list_for_each_entry_safe(subscriber, tmp_subscriber, &topic->subscribers, list) {
+            if (subscriber->pid == pid) {
+
+                /* Libera todas as mensagens pendentes do processo */
+                list_for_each_entry_safe(message, tmp_message, &subscriber->messages, list) {
+                    list_del(&message->list);
+                    kfree(message->message);
+                    kfree(message);
+                }
+
+                /* Remove o processo da lista de inscritos */
+                list_del(&subscriber->list);
+                kfree(subscriber);
+
+                pr_info("PID %d unsubscribed from '%s'\n", pid, topic->name);
+            }
+        }
+
+        /* Remove o topico caso nao tenha mais inscritos */
+        if (list_empty(&topic->subscribers)) {
+            pr_info("Topic '%s' removed\n", topic->name);
+
+            list_del(&topic->list);
+            kfree(topic);
+
+            number_of_topics--;
+        }
+    }
+
+    mutex_unlock(&pubsub_mutex);
+
+    pr_info("Publish/Subscribe device closed by PID %d\n", pid);
 
     return 0;
 }
+
 
 static ssize_t pubsub_read(struct file *filep, char __user *buffer, size_t len, loff_t *offset)
 {
@@ -174,11 +232,86 @@ static ssize_t pubsub_read(struct file *filep, char __user *buffer, size_t len, 
     return 0;
 }
 
+static int pubsub_publish(const char *name, const char *text)
+{
+    struct topic_node *topic;
+    struct subscriber_node *subscriber;
+    struct message_node *new_message;
+    struct message_node *message;
+    struct message_node *tmp;
+    LIST_HEAD(pending_messages);
+    int count = 0;
+    int err = 0;
+    bool found = false;
+
+    mutex_lock(&pubsub_mutex);
+
+    /* Procura o topico */
+    list_for_each_entry(topic, &topic_list, list) {
+        if (strcmp(topic->name, name) == 0) {
+            found = true;
+            break;
+        }
+    }
+
+    /* Ignora mensagens para topicos inexistentes */
+    if (!found)
+        goto unlock;
+
+    /* Prepara uma copia para cada inscrito */
+    list_for_each_entry(subscriber, &topic->subscribers, list) {
+        new_message = kmalloc(sizeof(struct message_node), GFP_KERNEL);
+
+        if (new_message == NULL) {
+            err = -ENOMEM;
+            goto err_messages;
+        }
+
+        new_message->message = kmalloc(strlen(text) + 1, GFP_KERNEL);
+
+        if (new_message->message == NULL) {
+            kfree(new_message);
+            err = -ENOMEM;
+            goto err_messages;
+        }
+
+        strcpy(new_message->message, text);
+        new_message->subscriber = subscriber;
+
+        list_add_tail(&new_message->list, &pending_messages);
+        count++;
+    }
+
+    /* Distribui as mensagens para as filas */
+    list_for_each_entry_safe(message, tmp, &pending_messages, list) {
+        list_move_tail(&message->list, &message->subscriber->messages);
+    }
+
+    pr_info("Published message to topic '%s' for %d subscriber(s)\n", name, count);
+
+    goto unlock;
+
+err_messages:
+    /* Libera as copias caso ocorra algum erro */
+    list_for_each_entry_safe(message, tmp, &pending_messages, list) {
+        list_del(&message->list);
+        kfree(message->message);
+        kfree(message);
+    }
+
+unlock:
+    mutex_unlock(&pubsub_mutex);
+
+    return err;
+}
 
 static ssize_t pubsub_write(struct file *filep, const char __user *buffer, size_t len, loff_t *offset)
 {
     char command[BUFFER_SIZE];
     int err;
+    char *topic_name;
+    char *message_text;
+    size_t message_length;
 
     if (len == 0)
         return 0;
@@ -199,6 +332,32 @@ static ssize_t pubsub_write(struct file *filep, const char __user *buffer, size_
 
     if (strncmp(command, "/subscribe ", 11) == 0) {
         err = pubsub_subscribe(strim(command + 11));
+
+        if (err != 0)
+            return err;
+
+        return len;
+    }
+
+    if (strncmp(command, "/publish ", 9) == 0) {
+        topic_name = command + 9;
+
+        message_text = strchr(topic_name, ' ');
+
+        if (message_text == NULL)
+            return -EINVAL;
+
+        *message_text = '\0';
+        message_text = strim(message_text + 1);
+
+        message_length = strlen(message_text);
+
+        if (message_length < 2 || message_text[0] != '"' || message_text[message_length - 1] != '"')
+            return -EINVAL;
+
+        message_text[message_length - 1] = '\0';
+
+        err = pubsub_publish(topic_name, message_text + 1);
 
         if (err != 0)
             return err;
@@ -275,6 +434,7 @@ topic_found:
     }
 
     new_subscriber->pid = pid;
+    INIT_LIST_HEAD(&new_subscriber->messages);
 
     list_add_tail(&new_subscriber->list, &topic->subscribers);
 

@@ -5,7 +5,6 @@
 !/modules/
 
 !/apps/
-/apps/banner/
 
 /custom-scripts/*
 !/custom-scripts/network-config
@@ -18,4 +17,4 @@
 !/modules/pubsub/Makefile
 !/modules/pubsub/pubsub.c
 
-!/README
+!/README.md
