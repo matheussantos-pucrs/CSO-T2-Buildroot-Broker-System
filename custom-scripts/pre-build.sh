@@ -15,3 +15,5 @@ make -C $BASE_DIR/../modules/hello
 make -C $BASE_DIR/../modules/chardrv
 
 make -C $BASE_DIR/../modules/timerdrv
+
+make -C $BASE_DIR/../modules/pubsub
