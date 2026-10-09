@@ -31,6 +31,7 @@ static int pubsub_open(struct inode *, struct file *);
 static int pubsub_release(struct inode *, struct file *);
 static int pubsub_subscribe(const char *);
 static int pubsub_publish(const char *, const char *);
+static int pubsub_fetch(struct file *, const char *);
 
 static struct file_operations fops = {
     .owner   = THIS_MODULE,
@@ -171,6 +172,7 @@ static void pubsub_exit(void)
 
 static int pubsub_open(struct inode *inodep, struct file *filep)
 {
+    filep->private_data = NULL;
     pr_info("Publish/Subscribe device opened by PID %d\n", task_pid_nr(current));
 
     return 0;
@@ -219,17 +221,86 @@ static int pubsub_release(struct inode *inodep, struct file *filep)
     }
 
     mutex_unlock(&pubsub_mutex);
+    kfree(filep->private_data);
+    filep->private_data = NULL;
 
     pr_info("Publish/Subscribe device closed by PID %d\n", pid);
 
     return 0;
 }
 
-
 static ssize_t pubsub_read(struct file *filep, char __user *buffer, size_t len, loff_t *offset)
 {
-    /* No messages available yet */
-    return 0;
+    struct topic_node *topic;
+    struct subscriber_node *subscriber;
+    struct message_node *message;
+    char *selected_topic;
+    pid_t pid = task_pid_nr(current);
+    size_t message_len;
+    ssize_t ret = -ENOENT;
+
+    if (len == 0)
+        return 0;
+
+    mutex_lock(&pubsub_mutex);
+
+    selected_topic = filep->private_data;
+
+    if (selected_topic == NULL) {
+        pr_alert("No topic selected for PID %d\n", pid);
+        ret = -EINVAL;
+        goto unlock;
+    }
+
+    list_for_each_entry(topic, &topic_list, list) {
+        if (strcmp(topic->name, selected_topic) == 0) {
+            ret = -EACCES;
+
+            list_for_each_entry(subscriber, &topic->subscribers, list) {
+                if (subscriber->pid == pid) {
+
+                    /* Verifica se existem mensagens pendentes */
+                    if (list_empty(&subscriber->messages)) {
+                        ret = 0;
+                        goto unlock;
+                    }
+
+                    /* Obtem a primeira mensagem da fila */
+                    message = list_first_entry(&subscriber->messages, struct message_node, list);
+                    message_len = strlen(message->message);
+
+                    if (len < message_len) {
+                        ret = -EMSGSIZE;
+                        goto unlock;
+                    }
+
+                    /* Copia a mensagem para o espaco de usuario */
+                    if (copy_to_user(buffer, message->message, message_len)) {
+                        ret = -EFAULT;
+                        goto unlock;
+                    }
+
+                    ret = message_len;
+
+                    pr_info("PID %d read %zu bytes from '%s'\n", pid, message_len, topic->name);
+
+                    /* Remove a mensagem da fila */
+                    list_del(&message->list);
+                    kfree(message->message);
+                    kfree(message);
+
+                    goto unlock;
+                }
+            }
+
+            goto unlock;
+        }
+    }
+
+unlock:
+    mutex_unlock(&pubsub_mutex);
+
+    return ret;
 }
 
 static int pubsub_publish(const char *name, const char *text)
@@ -305,6 +376,56 @@ unlock:
     return err;
 }
 
+
+static int pubsub_fetch(struct file *filep, const char *name)
+{
+    struct topic_node *topic;
+    struct subscriber_node *subscriber;
+    char *selected_topic;
+    pid_t pid = task_pid_nr(current);
+    int err = -ENOENT;
+
+    if (name[0] == '\0' || strchr(name, '/') || strpbrk(name, " \t\r\n"))
+        return -EINVAL;
+
+    if (strlen(name) >= TOPIC_NAME_SIZE)
+        return -ENAMETOOLONG;
+
+    mutex_lock(&pubsub_mutex);
+
+    list_for_each_entry(topic, &topic_list, list) {
+        if (strcmp(topic->name, name) == 0) {
+            err = -EACCES;
+
+            list_for_each_entry(subscriber, &topic->subscribers, list) {
+                if (subscriber->pid == pid) {
+                    selected_topic = kstrdup(name, GFP_KERNEL);
+
+                    if (selected_topic == NULL) {
+                        err = -ENOMEM;
+                        goto unlock;
+                    }
+
+                    kfree(filep->private_data);
+                    filep->private_data = selected_topic;
+
+                    pr_info("PID %d selected topic '%s'\n", pid, name);
+
+                    err = 0;
+                    goto unlock;
+                }
+            }
+
+            goto unlock;
+        }
+    }
+
+unlock:
+    mutex_unlock(&pubsub_mutex);
+
+    return err;
+}
+
 static ssize_t pubsub_write(struct file *filep, const char __user *buffer, size_t len, loff_t *offset)
 {
     char command[BUFFER_SIZE];
@@ -358,6 +479,15 @@ static ssize_t pubsub_write(struct file *filep, const char __user *buffer, size_
         message_text[message_length - 1] = '\0';
 
         err = pubsub_publish(topic_name, message_text + 1);
+
+        if (err != 0)
+            return err;
+
+        return len;
+    }
+
+    if (strncmp(command, "/fetch ", 7) == 0) {
+        err = pubsub_fetch(filep, strim(command + 7));
 
         if (err != 0)
             return err;
