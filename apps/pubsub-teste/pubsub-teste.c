@@ -1,6 +1,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 #define DEVICE_PATH "/dev/pubsub"
 #define BUFFER_SIZE 256
@@ -22,12 +23,48 @@ static int send_command(FILE *device, const char *command)
     return 0;
 }
 
+static int read_message(FILE *device)
+{
+    char buffer[BUFFER_SIZE];
+    ssize_t len;
+
+    len = read(fileno(device), buffer, sizeof(buffer) - 1);
+
+    if (len < 0) {
+        perror("Failed to read message");
+        return -1;
+    }
+
+    if (len == 0) {
+        printf("No pending messages\n");
+        return 0;
+    }
+
+    buffer[len] = '\0';
+
+    printf("Received message: %s\n", buffer);
+
+    return 0;
+}
+
+static void print_help(void)
+{
+    printf("\nAvailable commands:\n");
+    printf("  /subscribe <topic>\n");
+    printf("  /unsubscribe <topic>\n");
+    printf("  /publish <topic> \"<message>\"\n");
+    printf("  /fetch <topic>\n");
+    printf("  /read\n");
+    printf("  /help\n");
+    printf("  /exit\n\n");
+}
+
 int main(void)
 {
     FILE *device;
-    char buffer[BUFFER_SIZE];
-    const char *text = "Hello World!";
+    char command[BUFFER_SIZE];
     size_t len;
+    int ch;
 
     device = fopen(DEVICE_PATH, "r+");
 
@@ -36,48 +73,66 @@ int main(void)
         return 1;
     }
 
-    /* Inscreve em dois topicos */
-    if (send_command(device, "/subscribe teste") != 0)
-        goto error;
+    printf("Publish/Subscribe client - PID %d\n", getpid());
 
-    if (send_command(device, "/subscribe alertas") != 0)
-        goto error;
+    print_help();
 
-    /* Publica mensagem que ficara pendente */
-    if (send_command(device, "/publish teste \"Mensagem pendente\"") != 0)
-        goto error;
+    while (1) {
+        if (isatty(STDIN_FILENO)) {
+            printf("> ");
+            fflush(stdout);
+        }
 
-    /* Seleciona o topico teste */
-    if (send_command(device, "/fetch teste") != 0)
-        goto error;
+        if (fgets(command, sizeof(command), stdin) == NULL)
+            break;
 
-    /* Remove inscricao e mensagem pendente */
-    if (send_command(device, "/unsubscribe teste") != 0)
-        goto error;
+        len = strlen(command);
 
-    /* Verifica se o outro topico continua funcionando */
-    if (send_command(device, "/publish alertas \"Hello World!\"") != 0)
-        goto error;
+        if (len > 0 && command[len - 1] == '\n') {
+            command[--len] = '\0';
+        } else if (!feof(stdin)) {
+            printf("Command too long\n");
 
-    if (send_command(device, "/fetch alertas") != 0)
-        goto error;
+            while ((ch = getchar()) != '\n' && ch != EOF)
+                ;
 
-    len = fread(buffer, 1, strlen(text), device);
+            continue;
+        }
 
-    if (len != strlen(text)) {
-        fprintf(stderr, "Failed to read complete message\n");
-        goto error;
+        if (len > 0 && command[len - 1] == '\r')
+            command[--len] = '\0';
+
+        if (len == 0)
+            continue;
+
+        if (strcmp(command, "/exit") == 0)
+            break;
+
+        if (strcmp(command, "/help") == 0) {
+            print_help();
+            continue;
+        }
+
+        if (strcmp(command, "/read") == 0) {
+            read_message(device);
+            continue;
+        }
+
+        if (strncmp(command, "/subscribe ", 11) == 0 ||
+            strncmp(command, "/unsubscribe ", 13) == 0 ||
+            strncmp(command, "/publish ", 9) == 0 ||
+            strncmp(command, "/fetch ", 7) == 0) {
+
+            send_command(device, command);
+            continue;
+        }
+
+        printf("Unknown command: %s\n", command);
     }
 
-    buffer[len] = '\0';
-
-    printf("Received message: %s\n", buffer);
-
     fclose(device);
+
+    printf("Publish/Subscribe client closed\n");
 
     return 0;
-
-error:
-    fclose(device);
-    return 1;
 }

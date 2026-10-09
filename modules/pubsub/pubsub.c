@@ -12,7 +12,9 @@
 #include <linux/list.h>
 #include <linux/string.h>
 #include <linux/mutex.h>
-
+#include <linux/kobject.h>
+#include <linux/sysfs.h>
+#include <linux/kstrtox.h>
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Estudantes");
@@ -33,6 +35,8 @@ static int pubsub_subscribe(const char *);
 static int pubsub_publish(const char *, const char *);
 static int pubsub_fetch(struct file *, const char *);
 static int pubsub_unsubscribe(struct file *, const char *);
+static ssize_t topic_max_show(struct kobject *, struct kobj_attribute *, char *);
+static ssize_t topic_max_store(struct kobject *, struct kobj_attribute *, const char *, size_t);
 
 static struct file_operations fops = {
     .owner   = THIS_MODULE,
@@ -66,11 +70,16 @@ struct subscriber_node {
     struct list_head messages;
 };
 
+
 struct topic_node {
     struct list_head list;
     char name[TOPIC_NAME_SIZE];
     struct list_head subscribers;
+
+    unsigned int max_subscribers;
+    struct kobj_attribute max_subscribers_attr;
 };
+
 
 static LIST_HEAD(topic_list);
 
@@ -78,6 +87,66 @@ static int number_of_topics = 0;
 
 static DEFINE_MUTEX(pubsub_mutex);
 
+
+static struct kobject *pubsub_kobj = NULL;
+
+static unsigned int default_max_subscribers = 5;
+module_param(default_max_subscribers, uint, 0444);
+
+static DEFINE_MUTEX(topic_lifecycle_mutex);
+
+
+static ssize_t topic_max_show(struct kobject *kobj, struct kobj_attribute *attr, char *buffer)
+{
+    struct topic_node *topic;
+    unsigned int value;
+
+    topic = container_of(attr, struct topic_node, max_subscribers_attr);
+
+    mutex_lock(&pubsub_mutex);
+    value = topic->max_subscribers;
+    mutex_unlock(&pubsub_mutex);
+
+    return sysfs_emit(buffer, "%u\n", value);
+}
+
+static ssize_t topic_max_store(struct kobject *kobj, struct kobj_attribute *attr, const char *buffer, size_t len)
+{
+    struct topic_node *topic;
+    unsigned int value;
+    int err;
+
+    err = kstrtouint(buffer, 10, &value);
+    if (err != 0)
+        return err;
+
+    topic = container_of(attr, struct topic_node, max_subscribers_attr);
+
+    mutex_lock(&pubsub_mutex);
+
+    topic->max_subscribers = value;
+
+    pr_info("Topic '%s' subscriber limit changed to %u\n", topic->name, value);
+
+    mutex_unlock(&pubsub_mutex);
+
+    return len;
+}
+
+static void pubsub_free_subscriber(struct subscriber_node *subscriber)
+{
+    struct message_node *message;
+    struct message_node *tmp_message;
+
+    list_for_each_entry_safe(message, tmp_message, &subscriber->messages, list) {
+        list_del(&message->list);
+        kfree(message->message);
+        kfree(message);
+    }
+
+    list_del(&subscriber->list);
+    kfree(subscriber);
+}
 
 static int pubsub_init(void)
 {
@@ -114,6 +183,16 @@ static int pubsub_init(void)
     }
     pr_info("Publish/Subscribe registered class\n");
 
+    pubsub_kobj = kobject_create_and_add("pubsub", NULL);
+
+    if (pubsub_kobj == NULL) {
+        pr_err("Publish/Subscribe failed to create sysfs directory\n");
+        err = -ENOMEM;
+        goto err_kobj;
+    }
+
+    pr_info("Publish/Subscribe created /sys/pubsub\n");
+
     dev = device_create(cls, NULL, devno, NULL, DEVICE_NAME);
     if (IS_ERR(dev)) {
         pr_alert("Publish/Subscribe failed to create devfs file\n");
@@ -128,6 +207,8 @@ static int pubsub_init(void)
     return 0;
 
 err_dev:
+    kobject_put(pubsub_kobj);
+err_kobj:
     class_destroy(cls);
 err_cls:
     cdev_del(&chardev);
@@ -137,24 +218,21 @@ err_region:
     return err;
 }
 
+
 static void pubsub_exit(void)
 {
     struct topic_node *topic;
     struct topic_node *tmp_topic;
     struct subscriber_node *subscriber;
     struct subscriber_node *tmp_subscriber;
-    struct message_node *message;
-    struct message_node *tmp_message;
 
     list_for_each_entry_safe(topic, tmp_topic, &topic_list, list) {
+        /* Remove o atributo sysfs */
+        sysfs_remove_file(pubsub_kobj, &topic->max_subscribers_attr.attr);
+
+        /* Libera os inscritos e suas mensagens */
         list_for_each_entry_safe(subscriber, tmp_subscriber, &topic->subscribers, list) {
-            list_for_each_entry_safe(message, tmp_message, &subscriber->messages, list) {
-                list_del(&message->list);
-                kfree(message->message);
-                kfree(message);
-            }
-            list_del(&subscriber->list);
-            kfree(subscriber);
+            pubsub_free_subscriber(subscriber);
         }
 
         list_del(&topic->list);
@@ -163,6 +241,9 @@ static void pubsub_exit(void)
 
     number_of_topics = 0;
 
+    /* Remove /sys/pubsub */
+    kobject_put(pubsub_kobj);
+
     device_destroy(cls, devno);
     class_destroy(cls);
     cdev_del(&chardev);
@@ -170,6 +251,7 @@ static void pubsub_exit(void)
 
     pr_info("Publish/Subscribe module unloaded successfully\n");
 }
+
 
 static int pubsub_open(struct inode *inodep, struct file *filep)
 {
@@ -185,43 +267,42 @@ static int pubsub_release(struct inode *inodep, struct file *filep)
     struct topic_node *tmp_topic;
     struct subscriber_node *subscriber;
     struct subscriber_node *tmp_subscriber;
-    struct message_node *message;
-    struct message_node *tmp_message;
     pid_t pid = task_pid_nr(current);
 
+    LIST_HEAD(removed_topics);
+
+    mutex_lock(&topic_lifecycle_mutex);
     mutex_lock(&pubsub_mutex);
 
     list_for_each_entry_safe(topic, tmp_topic, &topic_list, list) {
         list_for_each_entry_safe(subscriber, tmp_subscriber, &topic->subscribers, list) {
             if (subscriber->pid == pid) {
-
-                /* Libera todas as mensagens pendentes do processo */
-                list_for_each_entry_safe(message, tmp_message, &subscriber->messages, list) {
-                    list_del(&message->list);
-                    kfree(message->message);
-                    kfree(message);
-                }
-
-                /* Remove o processo da lista de inscritos */
-                list_del(&subscriber->list);
-                kfree(subscriber);
+                pubsub_free_subscriber(subscriber);
 
                 pr_info("PID %d unsubscribed from '%s'\n", pid, topic->name);
             }
         }
 
-        /* Remove o topico caso nao tenha mais inscritos */
         if (list_empty(&topic->subscribers)) {
-            pr_info("Topic '%s' removed\n", topic->name);
-
-            list_del(&topic->list);
-            kfree(topic);
-
+            list_move_tail(&topic->list, &removed_topics);
             number_of_topics--;
+
+            pr_info("Topic '%s' removed\n", topic->name);
         }
     }
 
     mutex_unlock(&pubsub_mutex);
+
+    /* Remove os arquivos sysfs antes de liberar os topicos */
+    list_for_each_entry_safe(topic, tmp_topic, &removed_topics, list) {
+        sysfs_remove_file(pubsub_kobj, &topic->max_subscribers_attr.attr);
+
+        list_del(&topic->list);
+        kfree(topic);
+    }
+
+    mutex_unlock(&topic_lifecycle_mutex);
+
     kfree(filep->private_data);
     filep->private_data = NULL;
 
@@ -431,11 +512,9 @@ unlock:
 static int pubsub_unsubscribe(struct file *filep, const char *name)
 {
     struct topic_node *topic;
-    struct topic_node *tmp_topic;
+    struct topic_node *removed_topic = NULL;
     struct subscriber_node *subscriber;
     struct subscriber_node *tmp_subscriber;
-    struct message_node *message;
-    struct message_node *tmp_message;
     pid_t pid = task_pid_nr(current);
 
     if (name[0] == '\0' || strchr(name, '/') || strpbrk(name, " \t\r\n"))
@@ -444,45 +523,30 @@ static int pubsub_unsubscribe(struct file *filep, const char *name)
     if (strlen(name) >= TOPIC_NAME_SIZE)
         return -ENAMETOOLONG;
 
+    mutex_lock(&topic_lifecycle_mutex);
     mutex_lock(&pubsub_mutex);
 
-    /* Procura o topico */
-    list_for_each_entry_safe(topic, tmp_topic, &topic_list, list) {
+    list_for_each_entry(topic, &topic_list, list) {
         if (strcmp(topic->name, name) != 0)
             continue;
 
-        /* Procura o processo inscrito */
         list_for_each_entry_safe(subscriber, tmp_subscriber, &topic->subscribers, list) {
             if (subscriber->pid != pid)
                 continue;
 
-            /* Remove as mensagens pendentes */
-            list_for_each_entry_safe(message, tmp_message, &subscriber->messages, list) {
-                list_del(&message->list);
-                kfree(message->message);
-                kfree(message);
-            }
-
-            /* Remove a inscricao */
-            list_del(&subscriber->list);
-            kfree(subscriber);
+            pubsub_free_subscriber(subscriber);
 
             pr_info("PID %d unsubscribed from '%s'\n", pid, name);
 
-            /* Limpa o topico selecionado pelo fetch */
             if (filep->private_data != NULL && strcmp(filep->private_data, name) == 0) {
                 kfree(filep->private_data);
                 filep->private_data = NULL;
             }
 
-            /* Remove o topico se nao houver inscritos */
             if (list_empty(&topic->subscribers)) {
-                pr_info("Topic '%s' removed\n", topic->name);
-
                 list_del(&topic->list);
-                kfree(topic);
-
                 number_of_topics--;
+                removed_topic = topic;
             }
 
             goto unlock;
@@ -494,8 +558,19 @@ static int pubsub_unsubscribe(struct file *filep, const char *name)
 unlock:
     mutex_unlock(&pubsub_mutex);
 
+    if (removed_topic != NULL) {
+        sysfs_remove_file(pubsub_kobj, &removed_topic->max_subscribers_attr.attr);
+
+        pr_info("Topic '%s' removed\n", removed_topic->name);
+
+        kfree(removed_topic);
+    }
+
+    mutex_unlock(&topic_lifecycle_mutex);
+
     return 0;
 }
+
 
 static ssize_t pubsub_write(struct file *filep, const char __user *buffer, size_t len, loff_t *offset)
 {
@@ -587,6 +662,8 @@ static int pubsub_subscribe(const char *name)
     struct subscriber_node *subscriber;
     struct subscriber_node *new_subscriber;
     pid_t pid = task_pid_nr(current);
+    unsigned int count = 0;
+    bool found = false;
     int err = 0;
 
     if (name[0] == '\0' || strchr(name, '/') || strpbrk(name, " \t\r\n"))
@@ -595,57 +672,94 @@ static int pubsub_subscribe(const char *name)
     if (strlen(name) >= TOPIC_NAME_SIZE)
         return -ENAMETOOLONG;
 
+    mutex_lock(&topic_lifecycle_mutex);
     mutex_lock(&pubsub_mutex);
 
     /* Procura o topico */
     list_for_each_entry(topic, &topic_list, list) {
-        if (strcmp(topic->name, name) == 0)
-            goto topic_found;
-    }
-
-    /* Verifica o limite de topicos */
-    if (number_of_topics >= max_topics) {
-        pr_alert("Maximum number of topics reached\n");
-        err = -ENOSPC;
-        goto unlock;
-    }
-
-    /* Cria o topico */
-    new_topic = kmalloc(sizeof(struct topic_node), GFP_KERNEL);
-    if (new_topic == NULL) {
-        err = -ENOMEM;
-        goto unlock;
-    }
-
-    strscpy(new_topic->name, name, TOPIC_NAME_SIZE);
-    INIT_LIST_HEAD(&new_topic->subscribers);
-
-    list_add_tail(&new_topic->list, &topic_list);
-    number_of_topics++;
-
-    topic = new_topic;
-
-    pr_info("Topic '%s' created\n", name);
-
-topic_found:
-    /* Verifica se o PID ja esta inscrito */
-    list_for_each_entry(subscriber, &topic->subscribers, list) {
-        if (subscriber->pid == pid) {
-            pr_info("PID %d already subscribed to '%s'\n", pid, name);
-            goto unlock;
+        if (strcmp(topic->name, name) == 0) {
+            found = true;
+            break;
         }
     }
 
-    /* Cria uma nova inscricao */
+    if (found) {
+        /* Verifica inscricoes existentes */
+        list_for_each_entry(subscriber, &topic->subscribers, list) {
+            if (subscriber->pid == pid) {
+                pr_info("PID %d already subscribed to '%s'\n", pid, name);
+                goto unlock;
+            }
+
+            count++;
+        }
+
+        /* Verifica o limite de inscritos */
+        if (count >= topic->max_subscribers) {
+            pr_alert("Maximum subscribers reached for topic '%s'\n", name);
+            goto unlock;
+        }
+    } else {
+        /* Verifica o limite global de topicos */
+        if (number_of_topics >= max_topics) {
+            pr_alert("Maximum number of topics reached\n");
+            err = -ENOSPC;
+            goto unlock;
+        }
+
+        /* Aloca um novo topico */
+        new_topic = kmalloc(sizeof(struct topic_node), GFP_KERNEL);
+
+        if (new_topic == NULL) {
+            err = -ENOMEM;
+            goto unlock;
+        }
+
+        strscpy(new_topic->name, name, TOPIC_NAME_SIZE);
+        INIT_LIST_HEAD(&new_topic->subscribers);
+
+        new_topic->max_subscribers = default_max_subscribers;
+
+        /* Configura o atributo sysfs */
+        memset(&new_topic->max_subscribers_attr, 0, sizeof(new_topic->max_subscribers_attr));
+
+        sysfs_attr_init(&new_topic->max_subscribers_attr.attr);
+
+        new_topic->max_subscribers_attr.attr.name = new_topic->name;
+        new_topic->max_subscribers_attr.attr.mode = 0644;
+        new_topic->max_subscribers_attr.show = topic_max_show;
+        new_topic->max_subscribers_attr.store = topic_max_store;
+    }
+
+    /* Aloca a inscricao */
     new_subscriber = kmalloc(sizeof(struct subscriber_node), GFP_KERNEL);
+
     if (new_subscriber == NULL) {
         err = -ENOMEM;
-        goto err_subscriber;
+        goto err_topic;
     }
 
     new_subscriber->pid = pid;
     INIT_LIST_HEAD(&new_subscriber->messages);
 
+    if (new_topic != NULL) {
+        /* Cria /sys/pubsub/<nome_do_topico> */
+        err = sysfs_create_file(pubsub_kobj, &new_topic->max_subscribers_attr.attr);
+
+        if (err != 0) {
+            pr_err("Failed to create sysfs file for '%s'\n", name);
+            goto err_subscriber;
+        }
+
+        list_add_tail(&new_topic->list, &topic_list);
+        number_of_topics++;
+
+        topic = new_topic;
+
+        pr_info("Topic '%s' created\n", name);
+    }
+
+    /* Adiciona o processo ao topico */
     list_add_tail(&new_subscriber->list, &topic->subscribers);
 
     pr_info("PID %d subscribed to '%s'\n", pid, name);
@@ -653,14 +767,12 @@ topic_found:
     goto unlock;
 
 err_subscriber:
-    if (new_topic != NULL) {
-        list_del(&new_topic->list);
-        kfree(new_topic);
-        number_of_topics--;
-    }
-
+    kfree(new_subscriber);
+err_topic:
+    kfree(new_topic);
 unlock:
     mutex_unlock(&pubsub_mutex);
+    mutex_unlock(&topic_lifecycle_mutex);
 
     return err;
 }
